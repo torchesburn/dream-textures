@@ -1,5 +1,5 @@
 import bpy
-import tempfile
+import numpy as np
 from ..prompt_engineering import custom_structure
 from ..generator_process import Generator
 from ..generator_process.actions.upscale import ImageUpscaleResult
@@ -9,6 +9,20 @@ upscale_options = [
     ("4", "4x", "", 4),
     ("8", "8x", "", 8),
 ]
+
+def bpy_image(name, width, height, pixels, existing_image):
+    if existing_image is not None and (existing_image.size[0] != width or existing_image.size[1] != height):
+        bpy.data.images.remove(existing_image)
+        existing_image = None
+    if existing_image is None:
+        image = bpy.data.images.new(name, width=width, height=height)
+    else:
+        image = existing_image
+        image.name = name
+    image.pixels.foreach_set(pixels)
+    image.pack()
+    image.update()
+    return image
 
 class Upscale(bpy.types.Operator):
     bl_idname = "shade.dream_textures_upscale"
@@ -35,49 +49,25 @@ class Upscale(bpy.types.Operator):
 
         bpy.types.Scene.dream_textures_info = bpy.props.StringProperty(name="Info", update=step_progress_update)
 
-        def save_temp_image(img, path=None):
-            path = path if path is not None else tempfile.NamedTemporaryFile().name
-
-            settings = context.scene.render.image_settings
-            file_format = settings.file_format
-            mode = settings.color_mode
-            depth = settings.color_depth
-
-            settings.file_format = 'PNG'
-            settings.color_mode = 'RGBA'
-            settings.color_depth = '8'
-
-            img.save_render(path)
-
-            settings.file_format = file_format
-            settings.color_mode = mode
-            settings.color_depth = depth
-
-            return path
-
         input_image = None
-        input_image_path = None
         if active_node is not None and active_node.image is not None:
             input_image = active_node.image
-            input_image_path = save_temp_image(input_image)
         else:
             for area in context.screen.areas:
                 if area.type == 'IMAGE_EDITOR':
                     if area.spaces.active.image is not None:
                         input_image = area.spaces.active.image
-                        input_image_path = save_temp_image(input_image)
-        
         if input_image is None:
             self.report({"ERROR"}, "No open image in the Image Editor space, or selected Image Texture node.")
             return {"FINISHED"}
-
-        def bpy_image(name, width, height, pixels):
-            image = bpy.data.images.new(name, width=width, height=height)
-            image.pixels[:] = pixels
-            image.pack()
-            return image
+        image_pixels = np.flipud(
+            (np.array(input_image.pixels) * 255)
+                .astype(np.uint8)
+                .reshape((input_image.size[1], input_image.size[0], input_image.channels))
+        )
 
         generated_args = context.scene.dream_textures_upscale_prompt.generate_args()
+        context.scene.dream_textures_upscale_seamless_result.update_args(generated_args)
 
         # Setup the progress indicator
         def step_progress_update(self, context):
@@ -92,16 +82,13 @@ class Upscale(bpy.types.Operator):
         last_data_block = None
         def on_tile_complete(_, tile: ImageUpscaleResult):
             nonlocal last_data_block
-            if last_data_block is not None:
-                bpy.data.images.remove(last_data_block)
-                last_data_block = None
-            else:
+            if last_data_block is None:
                 bpy.types.Scene.dream_textures_progress = bpy.props.IntProperty(name="", default=tile.tile, min=0, max=tile.total, update=step_progress_update)
-            if tile.final:
+            if tile.final or tile.image is None:
                 return
             
             scene.dream_textures_progress = tile.tile
-            last_data_block = bpy_image(f"Tile {tile.tile}/{tile.total}", tile.image.shape[0], tile.image.shape[1], tile.image.ravel())
+            last_data_block = bpy_image(f"Tile {tile.tile}/{tile.total}", tile.image.shape[1], tile.image.shape[0], tile.image.ravel(), last_data_block)
             for area in screen.areas:
                 if area.type == 'IMAGE_EDITOR':
                     area.spaces.active.image = last_data_block
@@ -111,10 +98,10 @@ class Upscale(bpy.types.Operator):
             if last_data_block is not None:
                 bpy.data.images.remove(last_data_block)
                 last_data_block = None
-            tile: ImageUpscaleResult = future.result()
-            if isinstance(tile, list):
-                tile = tile[-1]
-            image = bpy_image(f"{input_image.name} (Upscaled)", tile.image.shape[0], tile.image.shape[1], tile.image.ravel())
+            tile: ImageUpscaleResult = future.result(last_only=True)
+            if tile.image is None:
+                return
+            image = bpy_image(f"{input_image.name} (Upscaled)", tile.image.shape[1], tile.image.shape[0], tile.image.ravel(), last_data_block)
             for area in screen.areas:
                 if area.type == 'IMAGE_EDITOR':
                     area.spaces.active.image = image
@@ -125,7 +112,7 @@ class Upscale(bpy.types.Operator):
         gen = Generator.shared()
         context.scene.dream_textures_upscale_prompt.prompt_structure = custom_structure.id
         f = gen.upscale(
-            image=input_image_path,
+            image=image_pixels,
             tile_size=context.scene.dream_textures_upscale_tile_size,
             blend=context.scene.dream_textures_upscale_blend,
             **generated_args

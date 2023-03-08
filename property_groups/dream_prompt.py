@@ -3,10 +3,15 @@ from bpy.props import FloatProperty, IntProperty, EnumProperty, BoolProperty, St
 import os
 import sys
 from typing import _AnnotatedAlias
+
+from ..generator_process.actions.detect_seamless import SeamlessAxes
 from ..generator_process.actions.prompt_to_image import Optimizations, Scheduler, StepPreviewMode, Pipeline
 from ..generator_process.actions.huggingface_hub import ModelType
 from ..prompt_engineering import *
 from ..preferences import StableDiffusionPreferences
+from .dream_prompt_validation import validate
+
+from functools import reduce
 
 scheduler_options = [(scheduler.value, scheduler.value, '') for scheduler in Scheduler]
 
@@ -44,45 +49,63 @@ def inpaint_mask_sources_filtered(self, context):
     return list(filter(lambda x: x[0] in available, inpaint_mask_sources))
 
 seamless_axes = [
-    ('x', 'X', '', 1),
-    ('y', 'Y', '', 2),
-    ('xy', 'Both', '', 3),
+    SeamlessAxes.AUTO.bpy_enum('Detect from source image when modifying or inpainting, off otherwise', -1),
+    SeamlessAxes.OFF.bpy_enum('', 0),
+    SeamlessAxes.HORIZONTAL.bpy_enum('', 1),
+    SeamlessAxes.VERTICAL.bpy_enum('', 2),
+    SeamlessAxes.BOTH.bpy_enum('', 3),
 ]
 
 def modify_action_source_type(self, context):
-    def options():
-        yield ('color', 'Color', 'Use the color information from the image', 1)
-        models = list(filter(
-            lambda m: m.model == self.model,
-            context.preferences.addons[StableDiffusionPreferences.bl_idname].preferences.installed_models
-        ))
-        if Pipeline[self.pipeline].depth() and len(models) > 0 and ModelType[models[0].model_type] == ModelType.DEPTH:
-            yield ('depth_generated', 'Color and Generated Depth', 'Use MiDaS to infer the depth of the initial image and include it in the conditioning. Can give results that more closely match the composition of the source image', 2)
-            yield ('depth_map', 'Color and Depth Map', 'Specify a secondary image to use as the depth map. Can give results that closely match the composition of the depth map', 3)
-            yield ('depth', 'Depth', 'Treat the initial image as a depth map, and ignore any color. Matches the composition of the source image without any color influence', 4)
-    return [*options()]
+    return [
+        ('color', 'Color', 'Use the color information from the image', 1),
+        ('depth_generated', 'Color and Generated Depth', 'Use MiDaS to infer the depth of the initial image and include it in the conditioning. Can give results that more closely match the composition of the source image', 2),
+        ('depth_map', 'Color and Depth Map', 'Specify a secondary image to use as the depth map. Can give results that closely match the composition of the depth map', 3),
+        ('depth', 'Depth', 'Treat the initial image as a depth map, and ignore any color. Matches the composition of the source image without any color influence', 4),
+    ]
 
 def model_options(self, context):
     match Pipeline[self.pipeline]:
         case Pipeline.STABLE_DIFFUSION:
-            return [(m.model, os.path.basename(m.model).replace('models--', '').replace('--', '/'), '', i) for i, m in enumerate(context.preferences.addons[StableDiffusionPreferences.bl_idname].preferences.installed_models)]
+            def model_case(model, i):
+                return (
+                    model.model_base,
+                    model.model_base.replace('models--', '').replace('--', '/'),
+                    ModelType[model.model_type].name,
+                    i
+                )
+            models = {}
+            for i, model in enumerate(context.preferences.addons[StableDiffusionPreferences.bl_idname].preferences.installed_models):
+                if model.model_type not in models:
+                    models[model.model_type] = [model_case(model, i)]
+                else:
+                    models[model.model_type].append(model_case(model, i))
+            return reduce(
+                lambda a, b: a + [None] + sorted(b, key=lambda m: m[0]),
+                [
+                    models[group]
+                    for group in sorted(models.keys())
+                ],
+                []
+            )
         case Pipeline.STABILITY_SDK:
-            return [(x, x, '') for x in [
-                "stable-diffusion-v1",
-                "stable-diffusion-v1-5",
-                "stable-diffusion-512-v2-0",
-                "stable-diffusion-768-v2-0",
-                "stable-inpainting-v1-0",
-                "stable-inpainting-512-v2-0"
-            ]]
+            return [
+                ("stable-diffusion-v1", "Stable Diffusion v1.4", ModelType.PROMPT_TO_IMAGE.name),
+                ("stable-diffusion-v1-5", "Stable Diffusion v1.5", ModelType.PROMPT_TO_IMAGE.name),
+                ("stable-diffusion-512-v2-0", "Stable Diffusion v2.0", ModelType.PROMPT_TO_IMAGE.name),
+                ("stable-diffusion-768-v2-0", "Stable Diffusion v2.0-768", ModelType.PROMPT_TO_IMAGE.name),
+                ("stable-diffusion-512-v2-1", "Stable Diffusion v2.1", ModelType.PROMPT_TO_IMAGE.name),
+                ("stable-diffusion-768-v2-1", "Stable Diffusion v2.1-768", ModelType.PROMPT_TO_IMAGE.name),
+                None,
+                ("stable-inpainting-v1-0", "Stable Inpainting v1.0", ModelType.INPAINTING.name),
+                ("stable-inpainting-512-v2-0", "Stable Inpainting v2.0", ModelType.INPAINTING.name),
+            ]
 
 def pipeline_options(self, context):
-    def options():
-        if Pipeline.local_available():
-            yield (Pipeline.STABLE_DIFFUSION.name, 'Stable Diffusion', 'Stable Diffusion on your own hardware', 1)
-        if len(context.preferences.addons[StableDiffusionPreferences.bl_idname].preferences.dream_studio_key) > 0:
-            yield (Pipeline.STABILITY_SDK.name, 'DreamStudio', 'Cloud compute via DreamStudio', 2)
-    return [*options()]
+    return [
+        (Pipeline.STABLE_DIFFUSION.name, 'Stable Diffusion', 'Stable Diffusion on your own hardware', 1),
+        (Pipeline.STABILITY_SDK.name, 'DreamStudio', 'Cloud compute via DreamStudio', 2)
+    ]
 
 def seed_clamp(self, ctx):
     # clamp seed right after input to make it clear what the limits are
@@ -103,12 +126,12 @@ attributes = {
     "negative_prompt": StringProperty(name="Negative Prompt", description="The model will avoid aspects of the negative prompt"),
 
     # Size
+    "use_size": BoolProperty(name="Manual Size", default=False),
     "width": IntProperty(name="Width", default=512, min=64, step=64),
     "height": IntProperty(name="Height", default=512, min=64, step=64),
 
     # Simple Options
-    "seamless": BoolProperty(name="Seamless", default=False, description="Enables seamless/tilable image generation"),
-    "seamless_axes": EnumProperty(name="Seamless Axes", items=seamless_axes, default='xy', description="Specify which axes should be seamless/tilable"),
+    "seamless_axes": EnumProperty(name="Seamless Axes", items=seamless_axes, default=SeamlessAxes.AUTO.id, description="Specify which axes should be seamless/tilable"),
 
     # Advanced
     "show_advanced": BoolProperty(name="", default=False),
@@ -117,7 +140,7 @@ attributes = {
     "iterations": IntProperty(name="Iterations", default=1, min=1, description="How many images to generate"),
     "steps": IntProperty(name="Steps", default=25, min=1),
     "cfg_scale": FloatProperty(name="CFG Scale", default=7.5, min=1, soft_min=1.01, description="How strongly the prompt influences the image"),
-    "scheduler": EnumProperty(name="Scheduler", items=scheduler_options, default=0),
+    "scheduler": EnumProperty(name="Scheduler", items=scheduler_options, default=3), # defaults to "DPM Solver Multistep"
     "step_preview_mode": EnumProperty(name="Step Preview", description="Displays intermediate steps in the Image Viewer. Disabling can speed up generation", items=step_preview_mode_options, default=1),
 
     # Init Image
@@ -125,7 +148,7 @@ attributes = {
     "init_img_src": EnumProperty(name=" ", items=init_image_sources, default="file"),
     "init_img_action": EnumProperty(name="Action", items=init_image_actions_filtered, default=1),
     "strength": FloatProperty(name="Noise Strength", description="The ratio of noise:image. A higher value gives more 'creative' results", default=0.75, min=0, max=1, soft_min=0.01, soft_max=0.99),
-    "fit": BoolProperty(name="Fit to width/height", default=True),
+    "fit": BoolProperty(name="Fit to width/height", description="Resize the source image to match the specified size", default=True),
     "use_init_img_color": BoolProperty(name="Color Correct", default=True),
     "modify_action_source_type": EnumProperty(name="Image Type", items=modify_action_source_type, default=1, description="What kind of data is the source image"),
     
@@ -143,6 +166,7 @@ attributes = {
 }
 
 default_optimizations = Optimizations()
+    
 for optim in dir(Optimizations):
     if optim.startswith('_'):
         continue
@@ -154,13 +178,13 @@ for optim in dir(Optimizations):
     if default is not None and not isinstance(getattr(default_optimizations, optim), bool):
         continue
     setattr(default_optimizations, optim, True)
-    if default_optimizations.can_use(optim, "mps" if sys.platform == "darwin" else "cuda"):
-        attributes[f"optimizations_{optim}"] = BoolProperty(name=optim.replace('_', ' ').title(), default=default)
+    attributes[f"optimizations_{optim}"] = BoolProperty(name=optim.replace('_', ' ').title(), default=default)
 attributes["optimizations_attention_slice_size_src"] = EnumProperty(name="Attention Slice Size", items=(
     ("auto", "Automatic", "", 1),
     ("manual", "Manual", "", 2),
 ), default=1)
-attributes["optimizations_attention_slice_size"] = IntProperty(name="Attention Slice Size", default=1)
+attributes["optimizations_attention_slice_size"] = IntProperty(name="Attention Slice Size", default=1, min=1)
+attributes["optimizations_batch_size"] = IntProperty(name="Batch Size", default=1, min=1)
 
 def map_structure_token_items(value):
     return (value[0], value[1], '')
@@ -238,6 +262,9 @@ def generate_args(self):
     args['pipeline'] = Pipeline[args['pipeline']]
     args['outpaint_origin'] = (args['outpaint_origin'][0], args['outpaint_origin'][1])
     args['key'] = bpy.context.preferences.addons[StableDiffusionPreferences.bl_idname].preferences.dream_studio_key
+    args['seamless_axes'] = SeamlessAxes(args['seamless_axes'])
+    args['width'] = args['width'] if args['use_size'] else None
+    args['height'] = args['height'] if args['use_size'] else None
     return args
 
 DreamPrompt.generate_prompt = generate_prompt
@@ -245,3 +272,4 @@ DreamPrompt.get_prompt_subject = get_prompt_subject
 DreamPrompt.get_seed = get_seed
 DreamPrompt.get_optimizations = get_optimizations
 DreamPrompt.generate_args = generate_args
+DreamPrompt.validate = validate

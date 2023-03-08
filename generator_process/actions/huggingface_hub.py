@@ -28,6 +28,23 @@ class ModelType(enum.IntEnum):
     @classmethod
     def _missing_(cls, _):
         return cls.UNKNOWN
+    
+    def recommended_model(self) -> str:
+        """Provides a recommended model for a given task.
+
+        This method has a bias towards the latest version of official Stability AI models.
+        """
+        match self:
+            case ModelType.PROMPT_TO_IMAGE:
+                return "stabilityai/stable-diffusion-2-1"
+            case ModelType.DEPTH:
+                return "stabilityai/stable-diffusion-2-depth"
+            case ModelType.UPSCALING:
+                return "stabilityai/stable-diffusion-x4-upscaler"
+            case ModelType.INPAINTING:
+                return "stabilityai/stable-diffusion-2-inpainting"
+            case _:
+                return "stabilityai/stable-diffusion-2-1"
 
 @dataclass
 class Model:
@@ -40,7 +57,8 @@ class Model:
 
 def hf_list_models(
     self,
-    query: str
+    query: str,
+    token: str,
 ) -> list[Model]:
     from huggingface_hub import HfApi, ModelFilter
     
@@ -53,32 +71,45 @@ def hf_list_models(
     filter = ModelFilter(tags="diffusers", task="text-to-image")
     models = api.list_models(
         filter=filter,
-        search=query
+        search=query,
+        use_auth_token=token
     )
-
-    return list(map(lambda m: Model(m.modelId, m.author, m.tags, m.likes, getattr(m, "downloads", -1), ModelType.UNKNOWN), models))
+    return [
+        Model(m.modelId, m.author or "", m.tags, m.likes if hasattr(m, "likes") else 0, getattr(m, "downloads", -1), ModelType.UNKNOWN)
+        for m in models
+        if m.modelId is not None and m.tags is not None and 'diffusers' in (m.tags or {})
+    ]
 
 def hf_list_installed_models(self) -> list[Model]:
     from diffusers.utils import DIFFUSERS_CACHE
     if not os.path.exists(DIFFUSERS_CACHE):
         return []
+
+    def detect_model_type(snapshot_folder):
+        unet_config = os.path.join(snapshot_folder, 'unet', 'config.json')
+        if os.path.exists(unet_config):
+            with open(unet_config, 'r') as f:
+                return ModelType(json.load(f)['in_channels'])
+        else:
+            return ModelType.UNKNOWN
+
     def _map_model(file):
         storage_folder = os.path.join(DIFFUSERS_CACHE, file)
+        model_type = ModelType.UNKNOWN
+
         if os.path.exists(os.path.join(storage_folder, 'model_index.json')):
             snapshot_folder = storage_folder
+            model_type = detect_model_type(snapshot_folder)
         else:
-            revision = "main"
-            ref_path = os.path.join(storage_folder, "refs", revision)
-            with open(ref_path) as f:
-                commit_hash = f.read()
+            for revision in os.listdir(os.path.join(storage_folder, "refs")):
+                ref_path = os.path.join(storage_folder, "refs", revision)
+                with open(ref_path) as f:
+                    commit_hash = f.read()
+                snapshot_folder = os.path.join(storage_folder, "snapshots", commit_hash)
+                if (detected_type := detect_model_type(snapshot_folder)) != ModelType.UNKNOWN:
+                    model_type = detected_type
+                    break
 
-            snapshot_folder = os.path.join(storage_folder, "snapshots", commit_hash)
-        model_type = ModelType.UNKNOWN
-        try:
-            with open(os.path.join(snapshot_folder, 'unet', 'config.json'), 'r') as f:
-                model_type = ModelType(json.load(f)['in_channels'])
-        except:
-            pass
         return Model(
             storage_folder,
             "",
@@ -87,7 +118,12 @@ def hf_list_installed_models(self) -> list[Model]:
             -1,
             model_type
         )
-    return [_map_model(file) for file in os.listdir(DIFFUSERS_CACHE) if os.path.isdir(os.path.join(DIFFUSERS_CACHE, file))]
+    return [
+        model for model in (
+            _map_model(file) for file in os.listdir(DIFFUSERS_CACHE) if os.path.isdir(os.path.join(DIFFUSERS_CACHE, file))
+        )
+        if model is not None
+    ]
 
 @dataclass
 class DownloadStatus:
@@ -98,7 +134,8 @@ class DownloadStatus:
 def hf_snapshot_download(
     self,
     model: str,
-    token: str
+    token: str,
+    revision: str | None = None
 ) -> Generator[DownloadStatus, None, None]:
     from filelock import FileLock
     from huggingface_hub.constants import (
@@ -109,13 +146,13 @@ def hf_snapshot_download(
     )
     from huggingface_hub.file_download import REGEX_COMMIT_HASH, repo_folder_name, hf_hub_url, _request_wrapper, hf_raise_for_status, logger, cached_download, build_hf_headers, get_hf_file_metadata, _cache_commit_hash_for_specific_revision, OfflineModeIsEnabled, _create_relative_symlink
     from huggingface_hub.hf_api import HfApi
-    from huggingface_hub.utils import filter_repo_objects, validate_hf_hub_args, tqdm, logging, EntryNotFoundError, LocalEntryNotFoundError
+    from huggingface_hub.utils import filter_repo_objects, validate_hf_hub_args, tqdm, logging, EntryNotFoundError, LocalEntryNotFoundError, RevisionNotFoundError
 
     from diffusers import StableDiffusionPipeline
     from diffusers.utils import DIFFUSERS_CACHE, WEIGHTS_NAME, CONFIG_NAME, ONNX_WEIGHTS_NAME
     from diffusers.schedulers.scheduling_utils import SCHEDULER_CONFIG_NAME
-    from diffusers.hub_utils import http_user_agent
-    config_dict = StableDiffusionPipeline.get_config_dict(
+    from diffusers.utils.hub_utils import http_user_agent
+    config_dict = StableDiffusionPipeline.load_config(
         model,
         cache_dir=DIFFUSERS_CACHE,
         resume_download=True,
@@ -127,8 +164,8 @@ def hf_snapshot_download(
     allow_patterns = [os.path.join(k, "*") for k in folder_names]
     allow_patterns += [WEIGHTS_NAME, SCHEDULER_CONFIG_NAME, CONFIG_NAME, ONNX_WEIGHTS_NAME, StableDiffusionPipeline.config_name]
 
-    # make sure we don't download flax weights
-    ignore_patterns = "*.msgpack"
+    # make sure we don't download flax, safetensors, or ckpt weights.
+    ignore_patterns = ["*.msgpack", "*.safetensors", "*.ckpt"]
 
     requested_pipeline_class = config_dict.get("_class_name", StableDiffusionPipeline.__name__)
     user_agent = {"pipeline_class": requested_pipeline_class}
@@ -593,12 +630,24 @@ def hf_snapshot_download(
                 yield DownloadStatus(repo_file, status, 1)
             yield DownloadStatus(repo_file, i + 1, len(filtered_repo_files))
 
-    yield from snapshot_download(
-        model,
-        cache_dir=DIFFUSERS_CACHE,
-        resume_download=True,
-        use_auth_token=token,
-        allow_patterns=allow_patterns,
-        ignore_patterns=ignore_patterns,
-        user_agent=user_agent,
-    )
+    try:
+        yield from snapshot_download(
+            model,
+            revision=revision,
+            cache_dir=DIFFUSERS_CACHE,
+            resume_download=True,
+            use_auth_token=token,
+            allow_patterns=allow_patterns,
+            ignore_patterns=ignore_patterns,
+            user_agent=user_agent,
+        )
+    except RevisionNotFoundError:
+        yield from snapshot_download(
+            model,
+            cache_dir=DIFFUSERS_CACHE,
+            resume_download=True,
+            use_auth_token=token,
+            allow_patterns=allow_patterns,
+            ignore_patterns=ignore_patterns,
+            user_agent=user_agent,
+        )

@@ -15,8 +15,8 @@ bl_info = {
     "name": "Dream Textures",
     "author": "Dream Textures contributors",
     "description": "Use Stable Diffusion to generate unique textures straight from the shader editor.",
-    "blender": (3, 0, 0),
-    "version": (0, 0, 9),
+    "blender": (3, 1, 0),
+    "version": (0, 1, 0),
     "location": "Image Editor -> Sidebar -> Dream",
     "category": "Paint"
 }
@@ -44,6 +44,7 @@ if current_process().name != "__actor__":
     from .tools import TOOLS
     from .operators.dream_texture import DreamTexture, kill_generator
     from .property_groups.dream_prompt import DreamPrompt
+    from .property_groups.seamless_result import SeamlessResult
     from .preferences import StableDiffusionPreferences
     from .ui.presets import register_default_presets
 
@@ -51,6 +52,7 @@ if current_process().name != "__actor__":
         ('requirements/win-linux-cuda.txt', 'Linux/Windows (CUDA)', 'Linux or Windows with NVIDIA GPU'),
         ('requirements/mac-mps-cpu.txt', 'Apple Silicon', 'Apple M1/M2'),
         ('requirements/linux-rocm.txt', 'Linux (AMD)', 'Linux with AMD GPU'),
+        ('requirements/win-dml.txt', 'Windows (DirectML)', 'Windows with DirectX 12 GPU'),
         ('requirements/dreamstudio.txt', 'DreamStudio', 'Cloud Compute Service')
     )
 
@@ -63,10 +65,10 @@ if current_process().name != "__actor__":
 
         bpy.types.Scene.dream_textures_requirements_path = EnumProperty(name="Platform", items=requirements_path_items, description="Specifies which set of dependencies to install", default='requirements/mac-mps-cpu.txt' if sys.platform == 'darwin' else 'requirements/win-linux-cuda.txt')
 
-        StableDiffusionPreferences.__annotations__['history'] = CollectionProperty(type=DreamPrompt)
-
         for cls in PREFERENCE_CLASSES:
             bpy.utils.register_class(cls)
+        
+        bpy.types.Scene.dream_textures_history = CollectionProperty(type=DreamPrompt)
 
         check_for_updates()
 
@@ -75,8 +77,9 @@ if current_process().name != "__actor__":
         bpy.types.Scene.init_img = PointerProperty(name="Init Image", type=bpy.types.Image)
         bpy.types.Scene.init_mask = PointerProperty(name="Init Mask", type=bpy.types.Image)
         bpy.types.Scene.init_depth = PointerProperty(name="Init Depth", type=bpy.types.Image, description="Use an existing depth map. Leave blank to generate one from the init image")
+        bpy.types.Scene.seamless_result = PointerProperty(type=SeamlessResult)
         def get_selection_preview(self):
-            history = bpy.context.preferences.addons[StableDiffusionPreferences.bl_idname].preferences.history
+            history = bpy.context.scene.dream_textures_history
             if self.dream_textures_history_selection > 0 and self.dream_textures_history_selection < len(history):
                 return history[self.dream_textures_history_selection].generate_prompt()
             return ""
@@ -93,9 +96,11 @@ if current_process().name != "__actor__":
         bpy.types.Scene.dream_textures_upscale_prompt = PointerProperty(type=DreamPrompt)
         bpy.types.Scene.dream_textures_upscale_tile_size = IntProperty(name="Tile Size", default=128, step=64, min=64, max=512)
         bpy.types.Scene.dream_textures_upscale_blend = IntProperty(name="Blend", default=32, step=8, min=0, max=512)
+        bpy.types.Scene.dream_textures_upscale_seamless_result = PointerProperty(type=SeamlessResult)
         
         bpy.types.Scene.dream_textures_project_prompt = PointerProperty(type=DreamPrompt)
         bpy.types.Scene.dream_textures_project_framebuffer_arguments = EnumProperty(name="Inputs", items=framebuffer_arguments)
+        bpy.types.Scene.dream_textures_project_bake = BoolProperty(name="Bake", default=False, description="Re-maps the generated texture onto the specified UV map")
 
         for cls in CLASSES:
             bpy.utils.register_class(cls)
